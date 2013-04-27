@@ -1,0 +1,457 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+#
+#       autoinstaller
+#
+#       Copyright 2012 Anna Rudkovskaya <anuta.rudik@gmail.com>
+#
+#       This program is free software; you can redistribute it and/or modify
+#       it under the terms of the GNU General Public License as published by
+#       the Free Software Foundation; either version 2 of the License, or
+#       (at your option) any later version.
+#
+#       This program is distributed in the hope that it will be useful,
+#       but WITHOUT ANY WARRANTY; without even the implied warranty of
+#       MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#       GNU General Public License for more details.
+#
+#       You should have received a copy of the GNU General Public License
+#       along with this program; if not, write to the Free Software
+#       Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
+#       MA 02110-1301, USA.
+#
+#
+import sys
+import zipfile
+import os
+import os.path
+import string
+import random
+import shutil
+from optparse import OptionParser
+from re import sub
+import ConfigParser
+import MySQLdb
+import Keyworder
+from ftplib import FTP
+
+
+class Autoinstaller:
+
+    workdir = os.path.dirname(os.path.realpath(__file__))
+    domain = None  # test.com
+    webroot = None  # /var/www/sitename.com/
+
+    # POSIX params
+    parser = OptionParser(usage="usage: %prog [options] domain_name",
+                                              version="%prog 0.0.3")
+
+    parser.add_option("-d", "--dir", dest="dir_path",
+                      help="Path to directory with websites")
+    parser.add_option("-y", "--yes", dest="yes",
+                      action="store_true", default=False, help="Enable 'delete without confirmation' mode")
+
+    parser.add_option("-p", "--piwik", dest="piwik_code",
+                      help="Piwik code here")
+    parser.add_option("-t", "--template", dest="template",
+                      help="Template name")
+    parser.add_option("-k", "--keys", dest="kwfile",
+                      help="Keys file name")
+    parser.add_option("--ftps", dest="ftps",
+                      help="List of FTP configs for sending format 1 like 'ftp1, ftp2'")
+    parser.add_option("--ftps2", dest="ftps2",
+                      help="Second option list of FTP configs for sending format 1 like 'ftp1, ftp2'")
+    parser.add_option("--rand4", dest="rand4",
+                      help="Count for generating format 4, like '1-10'")
+    parser.add_option("--rand8", dest="rand8",
+                      help="Count for generating format 8, like '1-10'")
+    parser.add_option("--rand9", dest="rand9",
+                      help="Count for generating format 9, like '1-10'")
+    parser.add_option("--dodot", dest="dodot",
+                      help="Делать ли через точку (0 - Нет / 1 - Да)")
+    parser.add_option("--format12", dest="format12",
+                      help="Spam as format 1.2 (0 - Нет / 1 - Да)")
+    parser.add_option("--subdomain", dest="subdomain",
+                      help="Subdomain using (e.g. 'subdom.dom.com' or '0')")
+    parser.add_option("--debug", dest="debug",
+                      help="Enable debug mode", action="store_true")
+    parser.add_option("-q", "--quiet",
+                      action="store_false", dest="verbose", default=False,
+                      help="don't print status messages to stdout")
+
+    (options, args) = parser.parse_args()
+    # get configuration from file
+    config = ConfigParser.RawConfigParser()
+    config.read(workdir + '/config.cfg')
+    ftpConfig = ConfigParser.RawConfigParser()
+    ftpConfig.read(workdir + '/ftp.cfg')
+
+    options.rand = {}
+    options.rand[3] = options.rand4
+    options.rand[7] = options.rand8
+    options.rand[8] = options.rand9
+    options.rand[12] = options.format12
+
+    def pre_set(self):
+        """ Метод для получения, проверки и установки исходных значений """
+        # if os.geteuid() != 0: self.parser.error("are you root?")
+        if len(self.args) != 1:
+            self.parser.error("wrong number of arguments")
+        else:
+            self.domain = self.args[0]
+
+        if (self.options.dir_path == None):
+            self.webroot = self.config.get('defaults', 'webdir')
+            r = self.getWebDir(self.webroot, self.domain)
+            if len(r) > 0:
+                self.webdir = r[0]
+                if self.options.debug == True:
+                    print "Web directory found: '" + self.webdir + "'"
+            else:
+                raise Exception("Error. Can't find catalog for exclude files.")
+        else:
+            self.webdir = self.options.dir_path
+
+        if (self.options.piwik_code == None):
+            self.options.piwik_code = raw_input("Enter Piwik code: ")
+        if (self.options.template == None):
+            self.options.template = self.templ_select(
+                self.workdir + "/templates/")
+        if (self.options.kwfile == None):
+            self.options.kwfile = self.keywords_select(
+                self.workdir + "/keywords/")
+        try:
+            if not self.options.dodot:
+                self.options.dodot = 0
+            else:
+                self.options.dodot = int(self.options.dodot)
+        except AttributeError as e:
+            self.options.dodot = 0
+        try:
+            if not self.options.format12:
+                self.options.format12 = 0
+        except AttributeError as e:
+            self.options.format12 = 0
+        try:
+            if not self.options.subdomain:
+                self.options.subdomain = 0
+        except AttributeError as e:
+            self.options.subdomain = 0
+
+        if not self.options.subdomain or self.options.subdomain == "0":
+            templDir = 'templates'
+        else:
+            templDir = 'templates2'
+            self.webdir = self.webdir + '/' + self.options.subdomain
+            try:
+                os.mkdir(self.webdir)
+            except OSError as e:
+                pass
+            self.domain = self.options.subdomain + '.' + self.domain
+
+        self.options.templDir = self.workdir + \
+            "/" + templDir + "/" + self.options.template + "/"
+
+    def getWebDir(self, head_dir, dir_name):
+        """Return a list of the full paths of the subdirectories
+        under directory 'head_dir' named 'dir_name'"""
+        dirList = []
+        level = 1
+        for fn in os.listdir(head_dir):
+            dirfile = os.path.join(head_dir, fn)
+            if os.path.isdir(dirfile):
+                if fn.upper() == dir_name.upper():
+                    dirList.append(dirfile)
+                else:
+                    # print "Accessing directory %s" % dirfile
+                    if fn.find('.') > 0:
+                        continue
+                    else:
+                        dirList += self.getWebDir(dirfile, dir_name)
+        return dirList
+
+    def unzip_file_into_dir(self, file, dir):
+        if not os.path.exists(dir):
+            print "Directory for extracting not exist!"
+            exit(1)
+        if not os.listdir(dir) == []:
+            print "Directory " + dir + " not empty!"
+            del_flag = False
+            while del_flag != "y" and del_flag != "n":
+                if (self.options.yes == True):
+                    del_flag = "y"
+                    break
+                del_flag = raw_input(
+                    "Do you want clean this (" + dir + ") directory? [y/n]: ")
+            if del_flag == "y":
+                shutil.rmtree(dir)
+                os.makedirs(dir)
+                os.chmod(dir, 0o777)
+            else:
+                print "Exit"
+                exit(0)
+        zfobj = zipfile.ZipFile(file)
+        for name in zfobj.namelist():
+            global options
+            if self.options.debug == True:
+                # print name+ " extracted."
+                pass
+            if name.endswith('/'):
+                os.mkdir(os.path.join(dir, name))
+            else:
+                # print "FileName is: "+name
+                try:
+                    outfile = open(os.path.join(dir, name), 'wb')
+                    outfile.write(zfobj.read(name))
+                    outfile.close()
+                    self.file_replace(
+                        dir + '/' + name, '{urltochange}', self.domain)
+                    self.file_replace(
+                        dir + '/' + name, '{piwikcodehere}', self.options.piwik_code)
+
+                    while (self.isinfile(dir + '/' + name, '{titlehere}')):
+                        self.file_replace(dir + '/' + name, '{titlehere}', self.getRandStr(
+                            self.options.templDir + 'titles.txt'), 1)
+                    while (self.isinfile(dir + '/' + name, '{descrhere}')):
+                        self.file_replace(dir + '/' + name, '{descrhere}', self.getRandStr(
+                            self.options.templDir + 'descrs.txt'), 1)
+                except UnicodeEncodeError:
+                    print "UnicodeEncodeError! Continue..."
+                    continue
+
+        try:
+            open(dir + "/system/configs/config.ini", "w")
+            dbname = sub('\.', '', self.domain)
+            dbname = dbname.replace("-", "_")
+
+            for (opt, val) in self.config.items('configini'):
+                with open(dir + "/system/configs/config.ini", "a") as f:
+                    # print opt+' : '+val
+                    f.write(opt + " = \"" + val + "\"\n")
+            with open(dir + "/system/configs/config.ini", "a") as f:
+                f.write("dbdatabase = \"" + dbname + "\"\n")
+        except IOError:
+            print "Somthing wrong while create config.ini. Skipped."
+
+    def isinfile(self, filename, search):
+        infile = open(filename, 'r')
+        lines = infile.readlines()
+        for line in lines:  # loop over the lines
+            if search in line:  # test if search is substring of line
+                return True
+
+        infile.close()
+        return False
+
+    def getRandStr(self, filename):
+        # filename =
+        # self.workdir+"/"+templDir+"/"+self.options.template+"/"+file
+
+        file = open(filename, 'r')
+        file_size = os.stat(filename)[6]
+        file.seek((file.tell() + random.randint(0, file_size - 1)) % file_size)
+        file.readline()
+        line = file.readline()
+        file.close()
+        return line
+
+    def templ_select(self, dir):
+        templates_list = []
+        for d in os.listdir(dir):
+            templates_list.append(d)
+        i = 0
+        for t in templates_list:
+            i += 1
+            print i, "- " + t
+        select_templ = int(raw_input("\nВыберите шаблон: "))
+        return templates_list[select_templ - 1]
+
+    # объеденить с предыдущим
+    def keywords_select(self, dir):
+        templates_list = []
+        for d in os.listdir(dir):
+            templates_list.append(d)
+        i = 0
+        for t in templates_list:
+            i += 1
+            print i, "- " + t
+        select_templ = int(raw_input("\nВыберите файл с ключ. словами: "))
+        return templates_list[select_templ - 1]
+
+    def rnd(self, size=6, chars=string.ascii_uppercase + string.digits):
+        return ''.join(random.choice(chars) for x in range(size))
+
+    def file_replace(self, filename, oldtext, newtext,limit=9999):
+        with open(filename) as thefile:
+            content = thefile.read()
+                                   # read entire file into memory
+            replacedText = content.replace(oldtext, newtext.strip(), limit)
+        if replacedText != content:
+            with open(filename, 'w') as thefile:
+                thefile.write(replacedText)
+
+    def chown_chmod(self, dir):
+        for root, dirs, files in os.walk(dir):
+            for momo in dirs:
+                os.chown(os.path.join(root, momo),
+                    int(self.config.get('defaults', 'uid')),
+                    int(self.config.get('defaults', 'gid')))
+                os.chmod(os.path.join(root, momo), 0o777)
+            for momo in files:
+                os.chown(os.path.join(root, momo),
+                    int(self.config.get('defaults', 'uid')),
+                    int(self.config.get('defaults', 'gid')))
+
+    def create_new_db(self, newDbName):
+        mysqldump = "/tmp/." + self.rnd() + '.tmp'
+        try:
+            shutil.copyfile(self.options.templDir + "backup.sql", mysqldump)
+        except IOError as xxx_todo_changeme:
+            (errno, strerror) = xxx_todo_changeme.args
+            if (errno == 2):
+                # File backup.sql not exist
+                # Just skip DB things
+                return True
+
+        self.file_replace(mysqldump, '{urltochange}', self.domain)
+
+        self.db.cursor.execute(
+            "CREATE DATABASE  `" + newDbName + "` DEFAULT CHARACTER SET utf8 COLLATE utf8_general_ci;")
+        self.db.cursor.execute("GRANT ALL PRIVILEGES ON  `" + newDbName + "` . * TO  '" + self.config.get(
+            'configini', 'dbuser') + "'@'localhost' WITH GRANT OPTION ;")
+        print "Database \"" + newDbName + "\" created."
+        row = self.db.cursor.fetchone()
+        # print row
+        os.system("mysql --default-character-set utf8 --host '" + self.config.get('mysqld', 'host') + "' --user=" + self.config.get(
+            'mysqld', 'user') + " --password=" + self.config.get('mysqld', 'passwd') + " " + newDbName + " < " + mysqldump)
+        os.remove(mysqldump)
+        print "Database import succesfull."
+        # print "answer:", row[0]
+
+    def sendByFTP(self,filename,num=0):
+        if num == 1:
+            ftps = self.options.ftps.split(",")
+            newfilename = 'spam_' + self.domain + '_1.txt'
+        elif num == 2:
+            ftps = self.options.ftps2.split(",")
+            newfilename = 'spam_' + self.domain + '_2.txt'
+        else:
+            ftps = self.options.ftps.split(",")
+            newfilename = 'spam_' + self.domain + '.txt'
+
+        for ftp in ftps:
+            ftp = ftp.strip()
+            if ftp == '':
+                break
+
+            try:
+                host = self.ftpConfig.get(ftp, 'ip')
+                user = self.ftpConfig.get(ftp, 'user')
+                passwd = self.ftpConfig.get(ftp, 'passwd')
+                path = self.ftpConfig.get(ftp, 'path')
+            except ConfigParser.NoSectionError:
+                print "Вы указали имя FTP сервера, для которого нет настроек (" + ftp + "). Пропускаем."
+                break
+
+            try:
+                ftpc = FTP(
+                    host, user, passwd)   # connect to host, default port
+            except socket.error:
+                print "Error. Пропускаем фтп " + ftp
+                break
+
+            if bool(ftpc.cwd(path)):
+                print str(ftp) + " connection ok!"
+            # ftpc.retrlines('LIST')
+            # print "----------------"
+            if bool(ftpc.storbinary('STOR ' + newfilename, open(filename, 'r'))):
+                print "Transfer " + newfilename + " to " + str(ftp) + " OK!"
+            ftpc.quit()
+        os.remove(filename)
+
+    def __init__(self):
+        # print self.workdir
+        # print self.config.get('mysqld','host')
+        self.pre_set()
+        self.unzip_file_into_dir(open(self.options.templDir +
+                                'backup.zip'), self.webdir)
+
+        keyFiles = Keyworder.KeysGenerator(self)
+
+        shutil.move(keyFiles['keystxt'], self.webdir + '/multidomain/keys.txt')
+
+        if (keyFiles['random4'] != None):
+            shutil.move(keyFiles[
+                        'random4'], self.webdir + '/multidomain/random4.txt')
+        if (keyFiles['random8'] != None):
+            shutil.move(keyFiles[
+                        'random8'], self.webdir + '/multidomain/random8.txt')
+        if (keyFiles['random9'] != None):
+            shutil.move(keyFiles[
+                        'random9'], self.webdir + '/multidomain/random9.txt')
+
+        if (keyFiles['spam'] != None):
+            self.sendByFTP(keyFiles['spam'])
+
+        elif (keyFiles['spam1'] != None and keyFiles['spam2'] != None):
+            self.sendByFTP(keyFiles['spam1'], 1)
+            self.sendByFTP(keyFiles['spam2'], 2)
+
+        self.chown_chmod(self.webdir)
+
+        self.db = DbConn(self.config)
+        dbname = sub('\.', '', self.domain)
+        dbname = dbname.replace("-", "_")
+        print "DBNAME:%s;" % dbname
+        try:
+            self.create_new_db(dbname)
+        except MySQLdb.Error as xxx_todo_changeme1:
+            (errno, errstr) = xxx_todo_changeme1.args
+            if errno == 1007:
+                del_flag = None
+                while del_flag != "y" and del_flag != "n":
+                    if (self.options.yes == True):
+                        del_flag = "y"
+                        break
+                    del_flag = raw_input(
+                        "Database already exist! Do you want drop database '" + dbname + "'? [y/n]: ")
+                if del_flag == "y":
+                    self.db.delete_db(dbname)
+                    self.create_new_db(dbname)
+                else:
+                    print "Aborted."
+                    exit(1)
+            else:
+                print "Unknown mysql error: " + errstr
+                exit(1)
+
+
+class DbConn:
+
+    """Mysql database class"""
+    dbName = False
+
+    def __init__(self, config):
+        self.conn = MySQLdb.connect(host=config.get('mysqld', 'host'),
+                   user=config.get('mysqld', 'user'),
+                   passwd=config.get('mysqld', 'passwd'),
+                   )
+        self.cursor = self.conn.cursor()
+
+    def delete_db(self, dbName):
+        dbName.replace("-", "_")
+        self.cursor.execute("DROP DATABASE " + dbName + ";");
+
+    def __del__(self):
+        self.cursor.close()
+        self.conn.close()
+
+
+def main():
+    # print args[0]
+    ai = Autoinstaller()
+    print "Done."
+    return 0
+
+if __name__ == '__main__':
+    main()
